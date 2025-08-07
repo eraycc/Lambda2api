@@ -1,28 +1,28 @@
-// main.ts - Deno Deploy Lambda.chat proxy for OpenAI-compatible endpoints
+// deno-deploy-lambda-chat-proxy.ts
 
-// ============ Config ============
-const BASE_URL = "https://lambda.chat";
-const CONVERSATION_URL = `${BASE_URL}/conversation`;
-const DEFAULT_MODEL = "deepseek-r1";
+import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 
-const CANONICAL_MODELS = Array.from(
-  new Set([
-    "deepseek-llama3.3-70b",
-    "deepseek-r1",
-    "deepseek-r1-0528",
-    "apriel-5b-instruct",
-    "hermes-3-llama-3.1-405b-fp8",
-    "hermes3-405b-fp8-128k",
-    "llama3.1-nemotron-70b-instruct",
-    "lfm-40b",
-    "llama3.3-70b-instruct-fp8",
-    "qwen25-coder-32b-instruct",
-    "deepseek-v3-0324",
-    "llama-4-maverick-17b-128e-instruct-fp8",
-    "llama-4-scout-17b-16e-instruct",
-    "qwen3-32b-fp8",
-  ]),
-);
+const LAMBDA_CHAT_URL = "https://lambda.chat";
+const CONVERSATION_URL = `${LAMBDA_CHAT_URL}/conversation`;
+
+// 模型列表和别名
+const MODELS = [
+  "deepseek-llama3.3-70b",
+  "deepseek-r1",
+  "deepseek-r1-0528",
+  "apriel-5b-instruct",
+  "hermes-3-llama-3.1-405b-fp8",
+  "hermes3-405b-fp8-128k",
+  "llama3.1-nemotron-70b-instruct",
+  "lfm-40b",
+  "llama3.3-70b-instruct-fp8",
+  "qwen25-coder-32b-instruct",
+  "deepseek-v3-0324",
+  "llama-4-maverick-17b-128e-instruct-fp8",
+  "llama-4-scout-17b-16e-instruct",
+  "llama3.3-70b-instruct-fp8",
+  "qwen3-32b-fp8",
+];
 
 const MODEL_ALIASES: Record<string, string | string[]> = {
   "hermes-3": "hermes3-405b-fp8-128k",
@@ -32,485 +32,375 @@ const MODEL_ALIASES: Record<string, string | string[]> = {
   "qwen-2.5-coder-32b": "qwen25-coder-32b-instruct",
   "llama-4-maverick": "llama-4-maverick-17b-128e-instruct-fp8",
   "llama-4-scout": "llama-4-scout-17b-16e-instruct",
-  "qwen-3-32b": "qwen3-32b-fp8",
+  "qwen-3-32b": "qwen3-32b-fp8"
 };
 
-// ============ Utilities ============
-function jsonResponse(obj: unknown, status = 200, extraHeaders: HeadersInit = {}) {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      ...extraHeaders,
-    },
-  });
-}
+const DEFAULT_MODEL = "deepseek-r1";
 
-function errorResponse(message: string, type = "invalid_request_error", status = 400) {
-  return jsonResponse({ error: { message, type } }, status);
-}
-
-function toEpochSec(d = Date.now()) {
-  return Math.floor(d / 1000);
-}
-
-function randomChoice<T>(arr: T[]): T {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
-function resolveModel(userModel?: string): { userModel: string; internalModel: string } {
-  const requested = userModel || DEFAULT_MODEL;
-
-  if (CANONICAL_MODELS.includes(requested)) {
-    return { userModel: requested, internalModel: requested };
-  }
-  const alias = MODEL_ALIASES[requested];
-  if (alias) {
+// 获取实际使用的模型名称
+function getModel(model: string): string {
+  if (!model) return DEFAULT_MODEL;
+  
+  if (MODELS.includes(model)) return model;
+  
+  if (model in MODEL_ALIASES) {
+    const alias = MODEL_ALIASES[model];
     if (Array.isArray(alias)) {
-      const selected = randomChoice(alias);
-      return { userModel: requested, internalModel: selected };
+      return alias[Math.floor(Math.random() * alias.length)];
     }
-    return { userModel: requested, internalModel: alias };
+    return alias;
   }
-  throw new Error(`Model '${requested}' not found`);
+  
+  throw new Error(`Model ${model} not found`);
 }
 
-type CookieJar = Map<string, string>;
-
-function cookieJarToHeader(jar: CookieJar): string {
-  return Array.from(jar.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
+// 生成 UUID
+function generateUUID(): string {
+  return crypto.randomUUID();
 }
 
-function baseHeaders(jar: CookieJar): HeadersInit {
-  const h: HeadersInit = {
-    "Origin": BASE_URL,
-    "Referer": BASE_URL,
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Pragma": "no-cache",
-    "Cache-Control": "no-cache",
-    "User-Agent":
-      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-  };
-  if (jar.size > 0) {
-    h["Cookie"] = cookieJarToHeader(jar);
-  }
-  return h;
-}
-
-function getLastUserContent(messages: Array<{ role: string; content: unknown }>): string {
+// 获取最后一条用户消息
+function getLastUserMessage(messages: any[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.role === "user") {
-      const c = m.content as unknown;
-      if (typeof c === "string") return c;
-      if (Array.isArray(c)) {
-        // 如果是 array-of-content-parts，拼接为字符串
-        return (c as Array<any>).map((p) => (typeof p?.text === "string" ? p.text : p?.content || "")).join("");
-      }
-      // 兜底
-      try {
-        return JSON.stringify(c);
-      } catch {
-        return String(c ?? "");
-      }
+    if (messages[i].role === "user") {
+      return messages[i].content;
     }
   }
   return "";
 }
 
-// 提取文本中的第一个 UUID（兜底）
-function extractFirstUUID(text: string): string | null {
-  const m = text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-  return m ? m[0] : null;
+// 创建 OpenAI 格式的流式响应
+function createStreamResponse(content: string, finish = false): string {
+  const data = {
+    id: `chatcmpl-${generateUUID()}`,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: DEFAULT_MODEL,
+    choices: [{
+      index: 0,
+      delta: finish ? {} : { content },
+      finish_reason: finish ? "stop" : null
+    }]
+  };
+  return `data: ${JSON.stringify(data)}\n\n`;
 }
 
-// 解析 SvelteKit __data.json 风格文本，寻找 system 消息的 id
-function findMessageIdFromDataText(text: string): string | null {
-  for (const line of text.split("\n")) {
-    const s = line.trim();
-    if (!s) continue;
-    try {
-      const data = JSON.parse(s);
-      if (data?.type === "data" && Array.isArray(data.nodes)) {
-        for (const node of data.nodes) {
-          if (node?.type === "data" && Array.isArray(node.data)) {
-            for (const item of node.data) {
-              if (item && typeof item === "object" && item.id && item.from === "system") {
-                return item.id as string;
+// 创建 OpenAI 格式的非流式响应
+function createCompletionResponse(content: string, model: string): any {
+  return {
+    id: `chatcmpl-${generateUUID()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: model,
+    choices: [{
+      index: 0,
+      message: {
+        role: "assistant",
+        content: content
+      },
+      finish_reason: "stop"
+    }],
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0
+    }
+  };
+}
+
+// 处理聊天完成请求
+async function handleChatCompletion(request: Request): Promise<Response> {
+  try {
+    const body = await request.json();
+    const { messages, stream = false, model: userModel } = body;
+    
+    if (!messages || !Array.isArray(messages)) {
+      return new Response(JSON.stringify({ error: "Messages are required" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    
+    const model = getModel(userModel || DEFAULT_MODEL);
+    const userMessage = getLastUserMessage(messages);
+    
+    if (!userMessage) {
+      return new Response(JSON.stringify({ error: "No user message found" }), {
+        status: 400,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+    
+    // Headers for LambdaChat
+    const headers = {
+      "Origin": LAMBDA_CHAT_URL,
+      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+      "Accept": "*/*",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": LAMBDA_CHAT_URL,
+      "Content-Type": "application/json",
+      "Cookie": `hf-chat=${generateUUID()}`
+    };
+    
+    // Step 1: Create conversation
+    const createResponse = await fetch(CONVERSATION_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ model })
+    });
+    
+    if (!createResponse.ok) {
+      throw new Error(`Failed to create conversation: ${createResponse.status}`);
+    }
+    
+    const conversationData = await createResponse.json();
+    const conversationId = conversationData.conversationId;
+    
+    // Step 2: Get conversation data to extract message ID
+    const dataResponse = await fetch(
+      `${CONVERSATION_URL}/${conversationId}/__data.json?x-sveltekit-invalidated=11`,
+      { headers }
+    );
+    
+    if (!dataResponse.ok) {
+      throw new Error(`Failed to get conversation data: ${dataResponse.status}`);
+    }
+    
+    const dataText = await dataResponse.text();
+    let messageId: string | null = null;
+    
+    // Parse response to find message ID
+    const lines = dataText.split('\n');
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      
+      try {
+        const data = JSON.parse(line);
+        if (data.type === "data" && data.nodes) {
+          for (const node of data.nodes) {
+            if (node.type === "data" && node.data) {
+              for (const item of node.data) {
+                if (item?.id && item?.from === "system") {
+                  messageId = item.id;
+                  break;
+                }
               }
             }
           }
         }
+      } catch {
+        // Continue to next line
       }
-    } catch {
-      // 忽略当前行
+      
+      if (messageId) break;
     }
-  }
-  // 兜底：从整体文本里找任意 UUID
-  return extractFirstUUID(text);
-}
-
-// 从 buffer 中提取连续的 JSON 对象（支持跨 chunk 拼接）
-function extractJsonObjects(buffer: string): { objects: any[]; rest: string } {
-  const objects: any[] = [];
-  let depth = 0;
-  let inStr = false;
-  let escape = false;
-  let start = -1;
-
-  for (let i = 0; i < buffer.length; i++) {
-    const ch = buffer[i];
-
-    if (inStr) {
-      if (escape) {
-        escape = false;
-      } else if (ch === "\\") {
-        escape = true;
-      } else if (ch === '"') {
-        inStr = false;
-      }
-      continue;
-    } else {
-      if (ch === '"') {
-        inStr = true;
-        continue;
-      }
-      if (ch === "{") {
-        if (depth === 0) start = i;
-        depth++;
-      } else if (ch === "}") {
-        depth--;
-        if (depth === 0 && start !== -1) {
-          const jsonStr = buffer.slice(start, i + 1);
-          try {
-            objects.push(JSON.parse(jsonStr));
-          } catch {
-            // 丢弃解析失败的对象
-          }
-          start = -1;
-        }
+    
+    // Fallback: find any UUID in response
+    if (!messageId) {
+      const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/;
+      const match = dataText.match(uuidPattern);
+      if (match) {
+        messageId = match[0];
       }
     }
-  }
-
-  const rest = depth > 0 && start !== -1 ? buffer.slice(start) : "";
-  return { objects, rest };
-}
-
-// ============ Lambda.chat client core ============
-async function* lambdaChatStream({
-  internalModel,
-  userMessage,
-}: {
-  internalModel: string;
-  userMessage: string;
-}): AsyncGenerator<string, void, unknown> {
-  // 简单 CookieJar，只保留 hf-chat
-  const jar: CookieJar = new Map([["hf-chat", crypto.randomUUID()]]);
-
-  // 1) 创建会话
-  const createResp = await fetch(CONVERSATION_URL, {
-    method: "POST",
-    headers: {
-      ...baseHeaders(jar),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ model: internalModel }),
-  });
-  if (!createResp.ok) {
-    throw new Error(`LambdaChat: failed to create conversation (${createResp.status})`);
-  }
-  const createJson = await createResp.json();
-  const conversationId = createJson?.conversationId;
-  if (!conversationId) throw new Error("LambdaChat: no conversationId");
-
-  // 2) 拉取会话数据，解析 message_id
-  const dataResp = await fetch(
-    `${CONVERSATION_URL}/${conversationId}/__data.json?x-sveltekit-invalidated=11`,
-    { headers: baseHeaders(jar) },
-  );
-  if (!dataResp.ok) throw new Error(`LambdaChat: fetch __data.json failed (${dataResp.status})`);
-  const dataText = await dataResp.text();
-  const messageId = findMessageIdFromDataText(dataText);
-  if (!messageId) throw new Error("LambdaChat: cannot find message id");
-
-  // 3) 发送用户消息（multipart/form-data，字段名 data，application/json）
-  const payload = {
-    inputs: userMessage,
-    id: messageId,
-    is_retry: false,
-    is_continue: false,
-    web_search: false,
-    tools: [] as unknown[],
-  };
-  const fd = new FormData();
-  fd.append("data", new Blob([JSON.stringify(payload)], { type: "application/json" }));
-
-  const sendResp = await fetch(`${CONVERSATION_URL}/${conversationId}`, {
-    method: "POST",
-    headers: baseHeaders(jar),
-    body: fd,
-  });
-  if (!sendResp.ok) {
-    const t = await sendResp.text().catch(() => "");
-    throw new Error(`LambdaChat: send message failed (${sendResp.status}): ${t}`);
-  }
-  if (!sendResp.body) throw new Error("LambdaChat: empty response body");
-
-  const reader = sendResp.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      // 从 buffer 中提取完整 JSON 对象
-      const { objects, rest } = extractJsonObjects(buffer);
-      buffer = rest;
-
-      for (const obj of objects) {
-        if (!obj || typeof obj !== "object") continue;
-
-        const t = obj.type;
-        if (t === "stream" && typeof obj.token === "string") {
-          const token = obj.token.replace(/\u0000/g, "");
-          if (token) yield token;
-        } else if (t === "finalAnswer") {
-          // 结束
-          return;
-        } else if (t === "status" && obj.status === "keepAlive") {
-          // 心跳，忽略
-          continue;
-        }
-        // 其他类型: title/reasoning 等，OpenAI ChatCompletions 不用直接透出
-      }
+    
+    if (!messageId) {
+      throw new Error("Could not find message ID");
     }
-  } finally {
-    try {
-      reader.releaseLock();
-    } catch {}
-  }
-}
-
-// ============ OpenAI-compatible endpoints ============
-
-// GET /v1/models
-function handleModelsRequest(): Response {
-  // 返回真实模型 + 别名（便于客户端在 /v1/models 里看到可用别名）
-  const allModelIds = Array.from(
-    new Set<string>([...CANONICAL_MODELS, ...Object.keys(MODEL_ALIASES)]),
-  );
-
-  const now = toEpochSec();
-  const data = allModelIds.map((id) => ({
-    id,
-    object: "model",
-    created: now,
-    owned_by: "lambda.chat",
-  }));
-
-  return jsonResponse({ object: "list", data });
-}
-
-// POST /v1/chat/completions
-async function handleChatCompletions(request: Request): Promise<Response> {
-  if (request.method !== "POST") {
-    return errorResponse("Method not allowed", "invalid_request_error", 405);
-  }
-
-  let body: any;
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse("Invalid JSON body");
-  }
-
-  const messages = body?.messages ?? [];
-  const stream: boolean = Boolean(body?.stream);
-  const requestedModel: string | undefined = body?.model;
-
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return errorResponse("Messages must be a non-empty array");
-  }
-
-  let modelResolved: { userModel: string; internalModel: string };
-  try {
-    modelResolved = resolveModel(requestedModel);
-  } catch (e: any) {
-    return errorResponse(String(e?.message ?? "Model not found"));
-  }
-
-  const userText = getLastUserContent(messages);
-  if (!userText) {
-    return errorResponse("No user message found in 'messages'");
-  }
-
-  const id = `chatcmpl-${crypto.randomUUID()}`;
-  const created = toEpochSec();
-
-  if (stream) {
-    // SSE 流式返回
-    const upstream = lambdaChatStream({
-      internalModel: modelResolved.internalModel,
-      userMessage: userText,
-    });
-
-    const readable = new ReadableStream({
-      async start(controller) {
-        const encoder = new TextEncoder();
-
-        // 先发一个带 role 的空 delta（更贴近 OpenAI 的流式格式）
-        const roleChunk = {
-          id,
-          object: "chat.completion.chunk",
-          created,
-          model: modelResolved.userModel,
-          choices: [
-            {
-              index: 0,
-              delta: { role: "assistant" },
-              finish_reason: null,
-            },
-          ],
-        };
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(roleChunk)}\n\n`));
-
-        try {
-          for await (const token of upstream) {
-            const data = {
-              id,
-              object: "chat.completion.chunk",
-              created,
-              model: modelResolved.userModel,
-              choices: [
-                {
-                  index: 0,
-                  delta: { content: token },
-                  finish_reason: null,
-                },
-              ],
-            };
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
-          }
-
-          // 结束块
-          const doneData = {
-            id,
-            object: "chat.completion.chunk",
-            created,
-            model: modelResolved.userModel,
-            choices: [
-              {
-                index: 0,
-                delta: {},
-                finish_reason: "stop",
-              },
-            ],
-          };
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify(doneData)}\n\n`));
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          controller.close();
-        } catch (err) {
-          controller.error(err);
-        }
-      },
-    });
-
-    return new Response(readable, {
-      status: 200,
+    
+    // Step 3: Send user message
+    const formData = new FormData();
+    formData.append("data", JSON.stringify({
+      inputs: userMessage,
+      id: messageId,
+      is_retry: false,
+      is_continue: false,
+      web_search: false,
+      tools: []
+    }));
+    
+    const chatResponse = await fetch(`${CONVERSATION_URL}/${conversationId}`, {
+      method: "POST",
       headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "Transfer-Encoding": "chunked",
+        ...headers,
+        "Content-Type": undefined // Let fetch set the boundary for multipart/form-data
       },
+      body: formData
     });
-  } else {
-    // 非流式：合并文本
-    let fullText = "";
-    try {
-      for await (
-        const token of lambdaChatStream({
-          internalModel: modelResolved.internalModel,
-          userMessage: userText,
-        })
-      ) {
-        fullText += token;
-      }
-    } catch (e) {
-      console.error("Non-stream upstream error:", e);
-      return errorResponse("Upstream error", "server_error", 502);
+    
+    if (!chatResponse.ok) {
+      throw new Error(`Failed to send message: ${chatResponse.status}`);
     }
-
-    const resp = {
-      id,
-      object: "chat.completion",
-      created,
-      model: modelResolved.userModel,
-      choices: [
-        {
-          index: 0,
-          message: {
-            role: "assistant",
-            content: fullText,
-          },
-          finish_reason: "stop",
-        },
-      ],
-      usage: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-      },
-    };
-
-    return jsonResponse(resp, 200);
+    
+    // Handle streaming response
+    if (stream) {
+      const encoder = new TextEncoder();
+      const readable = new ReadableStream({
+        async start(controller) {
+          const reader = chatResponse.body!.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop() || "";
+              
+              for (const line of lines) {
+                if (!line.trim()) continue;
+                
+                try {
+                  const data = JSON.parse(line);
+                  
+                  if (data.type === "stream" && data.token) {
+                    const token = data.token.replace(/\u0000/g, "");
+                    if (token) {
+                      controller.enqueue(encoder.encode(createStreamResponse(token)));
+                    }
+                  } else if (data.type === "finalAnswer") {
+                    controller.enqueue(encoder.encode(createStreamResponse("", true)));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    break;
+                  }
+                } catch {
+                  // Ignore parse errors
+                }
+              }
+            }
+          } finally {
+            controller.close();
+          }
+        }
+      });
+      
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          "Connection": "keep-alive"
+        }
+      });
+    } else {
+      // Handle non-streaming response
+      const reader = chatResponse.body!.getReader();
+      const decoder = new TextDecoder();
+      let fullContent = "";
+      let buffer = "";
+      
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || "";
+        
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          
+          try {
+            const data = JSON.parse(line);
+            
+            if (data.type === "stream" && data.token) {
+              const token = data.token.replace(/\u0000/g, "");
+              if (token) {
+                fullContent += token;
+              }
+            } else if (data.type === "finalAnswer") {
+              break;
+            }
+          } catch {
+            // Ignore parse errors
+          }
+        }
+      }
+      
+      return new Response(JSON.stringify(createCompletionResponse(fullContent, model)), {
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  } catch (error) {
+    console.error("Error in handleChatCompletion:", error);
+    return new Response(JSON.stringify({ 
+      error: error instanceof Error ? error.message : "Internal server error" 
+    }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" }
+    });
   }
 }
 
-// ============ Router / CORS ============
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
-};
+// 处理模型列表请求
+function handleModels(): Response {
+  const modelList = {
+    object: "list",
+    data: MODELS.map(id => ({
+      id,
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: "lambda-chat"
+    }))
+  };
+  
+  return new Response(JSON.stringify(modelList), {
+    headers: { "Content-Type": "application/json" }
+  });
+}
 
+// 主请求处理器
 async function handler(request: Request): Promise<Response> {
   const url = new URL(request.url);
-
-  // Preflight
+  const path = url.pathname;
+  
+  // CORS headers
+  const corsHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization"
+  };
+  
+  // Handle preflight requests
   if (request.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: CORS_HEADERS });
+    return new Response(null, { headers: corsHeaders });
   }
-
+  
   try {
-    let resp: Response;
-
-    if (url.pathname === "/v1/models" && request.method === "GET") {
-      resp = handleModelsRequest();
-    } else if (url.pathname === "/v1/chat/completions" && request.method === "POST") {
-      resp = await handleChatCompletions(request);
-    } else if (url.pathname === "/" && request.method === "GET") {
+    if (url.pathname === "/" && request.method === "GET") {
       resp = jsonResponse({
         status: "ok",
         message: "Lambda.chat OpenAI-compatible proxy is running",
         endpoints: ["/v1/models", "/v1/chat/completions"],
       });
+    } else if (path === "/v1/models" && request.method === "GET") {
+      const response = handleModels();
+      return new Response(response.body, {
+        ...response,
+        headers: { ...response.headers, ...corsHeaders }
+      });
+    } else if (path === "/v1/chat/completions" && request.method === "POST") {
+      const response = await handleChatCompletion(request);
+      return new Response(response.body, {
+        ...response,
+        headers: { ...response.headers, ...corsHeaders }
+      });
     } else {
-      resp = errorResponse(`Path ${url.pathname} not found`, "invalid_request_error", 404);
+      return new Response(JSON.stringify({ error: "Not found" }), {
+        status: 404,
+        headers: { "Content-Type": "application/json", ...corsHeaders }
+      });
     }
-
-    // 加上 CORS 头
-    const h = new Headers(resp.headers);
-    for (const [k, v] of Object.entries(CORS_HEADERS)) h.set(k, v);
-    return new Response(resp.body, { status: resp.status, headers: h });
-  } catch (e) {
-    console.error("Handler error:", e);
-    return jsonResponse({ error: { message: "Internal server error", type: "server_error" } }, 500, CORS_HEADERS);
+  } catch (error) {
+    console.error("Handler error:", error);
+    return new Response(JSON.stringify({ 
+      error: error instanceof Error ? error.message : "Internal server error" 
+    }), {
+      status: 500,
+      headers: { "Content-Type": "application/json", ...corsHeaders }
+    });
   }
 }
 
